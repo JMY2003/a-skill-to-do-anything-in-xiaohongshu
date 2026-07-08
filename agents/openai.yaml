@@ -1,0 +1,4 @@
+interface:
+  display_name: "DoAnythingInXiaohongshu"
+  short_description: "SDK-style Xiaohongshu web automation with accounts and artifacts"
+  default_prompt: "Use $do-anything-in-xiaohongshu to run SDK-backed Xiaohongshu web workflows with saved login, reusable browser sessions, account profiles, operation plans, artifacts, diagnostics, feed exploration, and publishing helpers."
