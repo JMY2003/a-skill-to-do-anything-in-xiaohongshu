@@ -19,8 +19,11 @@ import {
   fillFirstEditable as sdkFillFirstEditable,
   clickAnyText as sdkClickAnyText,
   clickSemanticControl as sdkClickSemanticControl,
+  verifySemanticClick as sdkVerifySemanticClick,
+  verifyTextSubmission as sdkVerifyTextSubmission,
 } from "./sdk/interaction_actions.mjs";
 import { runPlan as sdkRunPlan } from "./sdk/plan_runner.mjs";
+import { acquireProcessLock, probeCdpEndpoint, validateCdpOwnership } from "./sdk/runtime_guard.mjs";
 
 const SKILL_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const STATE_DIR = path.join(SKILL_DIR, "state", "web");
@@ -65,9 +68,9 @@ const BLOCK_RULES = [
     url: /\/login\b|redirectReason=401|login\?redirectPath/i,
     text: /手机号登录|短信登录|扫码登录|获取验证码|登录后推荐|请先登录|登录后.*笔记/,
   },
-  { type: "captcha", text: /验证码|安全验证|拖动滑块|人机验证|验证通过/ },
+  { type: "captcha", text: /验证码|安全验证|拖动滑块|人机验证/ },
   { type: "rate-limit", text: /频繁|限流|稍后再试|操作过于频繁/ },
-  { type: "policy", text: /权限|无权|禁止|违规|审核|风险/ },
+  { type: "policy", text: /权限|无权|禁止|违规|风险|审核(?:未通过|不通过|拒绝)/ },
 ];
 
 function isSystemPage(url) {
@@ -80,6 +83,15 @@ function isXiaohongshuPage(url) {
 
 function cleanText(text) {
   return (text || "").replace(/\s+/g, " ").trim();
+}
+
+function loginEvidence(cookies, block) {
+  const sessionCookies = (cookies || [])
+    .map((cookie) => String(cookie.name || "").toLowerCase())
+    .filter((name) => /^(web_session|sessionid|sid_guard|passport_auth_token)$/.test(name));
+  if (block?.type === "login") return { loginState: "logged-out", loggedInLikely: false, sessionCookies };
+  if (sessionCookies.length) return { loginState: "likely-logged-in", loggedInLikely: true, sessionCookies };
+  return { loginState: "unknown", loggedInLikely: false, sessionCookies };
 }
 
 function parseArgs(argv) {
@@ -142,38 +154,7 @@ function ensureDir(dir) {
 }
 
 function acquireLock(name = "xiaohongshu-web") {
-  ensureDir(LOCK_DIR);
-  const lockPath = path.join(LOCK_DIR, `${name}.lock`);
-  const payload = {
-    pid: process.pid,
-    startedAt: new Date().toISOString(),
-    argv: process.argv,
-    cwd: process.cwd(),
-  };
-  try {
-    const fd = fs.openSync(lockPath, "wx", 0o600);
-    fs.writeFileSync(fd, JSON.stringify(payload, null, 2));
-    fs.closeSync(fd);
-  } catch (err) {
-    if (err.code !== "EEXIST") throw err;
-    const existing = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-    try {
-      process.kill(existing.pid, 0);
-      throw new Error(`Another Xiaohongshu automation command is running (pid=${existing.pid}, startedAt=${existing.startedAt})`);
-    } catch (killErr) {
-      if (killErr.code !== "ESRCH") throw killErr;
-      fs.rmSync(lockPath, { force: true });
-      return acquireLock(name);
-    }
-  }
-  return () => {
-    try {
-      const existing = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-      if (existing.pid === process.pid) fs.rmSync(lockPath, { force: true });
-    } catch (_) {
-      // Best-effort cleanup.
-    }
-  };
+  return acquireProcessLock({ lockDir: LOCK_DIR, name, label: "Xiaohongshu" });
 }
 
 function detectDefaultBrowserBundle() {
@@ -254,6 +235,15 @@ function userDataDir(browserName, accountName = "default") {
   return ACCOUNT_MANAGER.profileDir(browserName, accountName);
 }
 
+function legacyProfileRoots(accountName) {
+  if (accountName !== "default") return [];
+  const skillsDir = path.join(os.homedir(), ".codex", "skills");
+  return [
+    path.join(skillsDir, "rednote-local", "state", "web", "profiles"),
+    path.join(skillsDir, "do-anything-in-rednotes", "state", "web", "profiles"),
+  ];
+}
+
 function cdpSessionPath(browserName) {
   return path.join(STATE_DIR, "cdp-sessions", `${browserName}.json`);
 }
@@ -316,10 +306,16 @@ function executableForBrowser(browserName) {
 async function ensureCdpBrowser(browserName, accountName) {
   const port = CDP_PORTS[browserName];
   if (await isPortOpen(port)) {
-    const active = readCdpSession(browserName) || { account: "default" };
-    if ((active.account || "default") !== accountName) {
-      throw new Error(`Reusable ${browserName} CDP browser is already running for account '${active.account || "default"}'. Close it before using account '${accountName}'.`);
-    }
+    await validateCdpOwnership({
+      port,
+      browserName,
+      accountName,
+      profile: userDataDir(browserName, accountName),
+      profileRoot: path.join(STATE_DIR, "profiles"),
+      legacyProfileRoots: legacyProfileRoots(accountName),
+      readSession: () => readCdpSession(browserName),
+      writeSession: (session) => writeCdpSession(browserName, session),
+    });
     return { port, launched: false };
   }
 
@@ -468,129 +464,18 @@ async function safeCleanup(session) {
 
 async function pageSnapshot(page, limit = 50) {
   return await sdkPageSnapshot(page, limit);
-  return await page.evaluate((limit) => {
-    const clean = (text) => (text || "").replace(/\s+/g, " ").trim();
-    const visible = (el) => el instanceof HTMLElement && el.offsetParent !== null;
-    const describe = (el) => ({
-      tag: el.tagName,
-      text: clean(el.innerText || el.textContent).slice(0, 160),
-      role: el.getAttribute("role") || "",
-      aria: el.getAttribute("aria-label") || "",
-      title: el.getAttribute("title") || "",
-      type: el.getAttribute("type") || "",
-      placeholder: el.getAttribute("placeholder") || "",
-      disabled: Boolean(el.disabled) || el.getAttribute("disabled") !== null || el.getAttribute("aria-disabled") === "true",
-      classes: String(el.className || "").slice(0, 180),
-    });
-    const links = [...document.querySelectorAll("a[href]")]
-      .map((a) => ({
-        text: clean(a.innerText || a.textContent),
-        href: new URL(a.getAttribute("href"), location.href).href,
-      }))
-      .filter((item) => item.text || item.href)
-      .slice(0, limit);
-    const editables = [...document.querySelectorAll("textarea,input,[contenteditable='true'],[role='textbox']")]
-      .filter((el) => el instanceof HTMLElement && el.offsetParent !== null)
-      .map((el) => ({
-        tag: el.tagName,
-        placeholder: el.getAttribute("placeholder") || "",
-        role: el.getAttribute("role") || "",
-        text: clean(el.innerText || el.value || ""),
-      }))
-      .slice(0, 20);
-    const controls = [...document.querySelectorAll("button,[role='button'],input,textarea,[contenteditable='true'],[aria-label]")]
-      .filter(visible)
-      .map(describe)
-      .filter((item) => item.text || item.aria || item.title || item.placeholder || item.role || item.type)
-      .slice(0, limit);
-    const customElements = [...document.querySelectorAll("*")]
-      .filter((el) => el.tagName.includes("-") && visible(el))
-      .map((el) => ({
-        tag: el.tagName.toLowerCase(),
-        text: clean(el.innerText || el.textContent).slice(0, 160),
-        attrs: Object.fromEntries(
-          [...el.attributes]
-            .filter((attr) => /^(submit|data|aria|role|class|title|type|disabled)/i.test(attr.name))
-            .slice(0, 16)
-            .map((attr) => [attr.name, attr.value])
-        ),
-      }))
-      .slice(0, 40);
-    const scrollables = [...document.querySelectorAll("body,main,section,div")]
-      .filter((el) => {
-        if (!visible(el) && el !== document.body) return false;
-        return el.scrollHeight > el.clientHeight + 40 || el.scrollWidth > el.clientWidth + 40;
-      })
-      .map((el) => ({
-        tag: el.tagName,
-        id: el.id || "",
-        classes: String(el.className || "").slice(0, 180),
-        text: clean(el.innerText || el.textContent).slice(0, 120),
-        clientHeight: el.clientHeight,
-        scrollHeight: el.scrollHeight,
-        scrollTop: el.scrollTop,
-      }))
-      .slice(0, 30);
-    return {
-      url: location.href,
-      title: document.title,
-      body: clean(document.body?.innerText || "").slice(0, 8000),
-      links,
-      editables,
-      controls,
-      customElements,
-      scrollables,
-    };
-  }, limit);
 }
 
 async function detectBlock(page) {
   return await sdkDetectBlock(page, BLOCK_RULES);
-  const url = page.url();
-  const text = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
-  const excerpt = cleanText(text).slice(0, 600);
-  for (const rule of BLOCK_RULES) {
-    if ((rule.url && rule.url.test(url)) || (rule.text && rule.text.test(text))) {
-      return {
-        type: rule.type,
-        url,
-        pattern: String(rule.url && rule.url.test(url) ? rule.url : rule.text),
-        excerpt,
-      };
-    }
-  }
-  return null;
 }
 
 async function assertNotBlocked(page, label = "operation") {
   return await sdkAssertNotBlocked(page, BLOCK_RULES, `Xiaohongshu ${label}`);
-  const block = await detectBlock(page);
-  if (!block) return null;
-  throw new Error(`Xiaohongshu ${block.type} block during ${label}: ${block.excerpt || block.url}`);
 }
 
 async function scrollAllContainers(page) {
   return await sdkScrollAllContainers(page);
-  return await page.evaluate(() => {
-    const visible = (el) => el instanceof HTMLElement && (el.offsetParent !== null || el === document.body);
-    const items = [...document.querySelectorAll("body,main,section,div")]
-      .filter((el) => visible(el) && (el.scrollHeight > el.clientHeight + 40 || el.scrollWidth > el.clientWidth + 40));
-    return items.map((el) => {
-      const before = { top: el.scrollTop, left: el.scrollLeft };
-      el.scrollTop = el.scrollHeight;
-      el.scrollLeft = 0;
-      el.dispatchEvent(new Event("scroll", { bubbles: true }));
-      return {
-        tag: el.tagName,
-        id: el.id || "",
-        classes: String(el.className || "").slice(0, 180),
-        before,
-        after: { top: el.scrollTop, left: el.scrollLeft },
-        clientHeight: el.clientHeight,
-        scrollHeight: el.scrollHeight,
-      };
-    });
-  });
 }
 
 async function publishViaCreatorButton(page) {
@@ -654,8 +539,37 @@ async function publishViaCreatorButton(page) {
   return result;
 }
 
+async function clickAnyText(page, texts, waitMs = 700) {
+  return await sdkClickAnyText(page, texts, waitMs);
+}
+
 async function clickByText(page, text, exact = false) {
-  await page.getByText(text, { exact }).first().click();
+  if (exact) {
+    const candidates = page.getByText(text, { exact: true });
+    const count = await candidates.count().catch(() => 0);
+    for (let index = count - 1; index >= 0; index--) {
+      const candidate = candidates.nth(index);
+      if (!(await candidate.isVisible().catch(() => false))) continue;
+      await candidate.click();
+      return { clicked: true, text, exact: true, index };
+    }
+    throw new Error(`No clickable visible exact text found: ${text}`);
+  }
+  const result = await clickAnyText(page, [text], 0);
+  if (!result.clicked) throw new Error(`No clickable visible text found: ${text}`);
+  return result;
+}
+
+async function clickFirstVisibleSelector(page, selector, label = selector) {
+  const candidates = page.locator(selector);
+  const count = await candidates.count().catch(() => 0);
+  for (let index = 0; index < count; index++) {
+    const candidate = candidates.nth(index);
+    if (!(await candidate.isVisible().catch(() => false))) continue;
+    await candidate.click();
+    return { selector, index };
+  }
+  throw new Error(`No visible ${label} found for selector: ${selector}`);
 }
 
 async function cmdLogin(args) {
@@ -677,15 +591,17 @@ async function cmdStatus(args) {
   await goto(page, "https://www.xiaohongshu.com/explore");
   const cookies = await context.cookies("https://www.xiaohongshu.com");
   const block = await detectBlock(page);
+  const login = loginEvidence(cookies, block);
   const status = {
     browser: browserName,
     account: accountName,
     session: cdp ? "cdp-reused-browser" : "single-command-browser",
     cdpPort: cdpPort || null,
+    activeProfile: cdp ? readCdpSession(browserName)?.profile || userDataDir(browserName, accountName) : userDataDir(browserName, accountName),
     url: page.url(),
     title: await page.title().catch(() => ""),
     cookieCount: cookies.length,
-    loggedInLikely: Boolean(cookies.length) && block?.type !== "login",
+    ...login,
     block,
     profile: userDataDir(browserName, accountName),
   };
@@ -697,13 +613,17 @@ async function cmdBrowserStatus(args) {
   const browserName = normalizeBrowser(args.browser);
   const accountName = accountFromArgs(args);
   const port = CDP_PORTS[browserName] || null;
+  const endpoint = port ? await probeCdpEndpoint(port) : null;
+  const activeCdpSession = readCdpSession(browserName);
   const status = {
     browser: browserName,
     account: accountName,
     cdpSupported: Boolean(port),
     cdpPort: port,
-    running: port ? await isPortOpen(port) : false,
-    activeCdpSession: readCdpSession(browserName),
+    running: Boolean(endpoint?.reachable),
+    cdpEndpoint: endpoint,
+    activeCdpSession,
+    sessionState: !port ? "not-applicable" : activeCdpSession?.legacyProfile ? "legacy-adopted" : activeCdpSession ? "managed" : endpoint?.reachable ? "unmanaged-or-recoverable" : "stopped",
     profile: userDataDir(browserName, accountName),
   };
   console.log(JSON.stringify(status, null, 2));
@@ -715,8 +635,20 @@ async function cmdCloseBrowser(args) {
     console.log(JSON.stringify({ browser: browserName, closed: false, note: "no reusable CDP browser running" }, null, 2));
     return;
   }
-  const session = await launch(browserName, args.account);
-  await session.closeBrowser();
+  const accountName = accountFromArgs(args);
+  await validateCdpOwnership({
+    port: CDP_PORTS[browserName],
+    browserName,
+    accountName,
+    profile: userDataDir(browserName, accountName),
+    profileRoot: path.join(STATE_DIR, "profiles"),
+    legacyProfileRoots: legacyProfileRoots(accountName),
+    readSession: () => readCdpSession(browserName),
+    writeSession: (session) => writeCdpSession(browserName, session),
+    allowDifferentAccount: true,
+  });
+  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CDP_PORTS[browserName]}`);
+  await browser.close();
   clearCdpSession(browserName);
   console.log(JSON.stringify({ browser: browserName, closed: true, cdpPort: CDP_PORTS[browserName] }, null, 2));
 }
@@ -784,7 +716,7 @@ async function cmdFill(args) {
   const session = await launch(args.browser, args.account);
   const { context } = session;
   const page = await pageFor(context);
-  await page.locator(selector).first().fill(text);
+  await fillFirstVisible(page, [selector], text, selector);
   console.log(`filled: ${selector}`);
   await safeCleanup(session);
 }
@@ -797,56 +729,191 @@ async function fillFirstVisible(page, selectors, text, label) {
   return await sdkFillFirstVisible(page, selectors, text, label);
 }
 
+async function clickSemanticControl(page, kind) {
+  return await sdkClickSemanticControl(page, kind, {
+    like: /(点赞|赞|like)/i,
+    favorite: /(收藏|collect|favorite|save)/i,
+    collect: /(收藏|collect|favorite|save)/i,
+    comment: /(评论|comment)/i,
+    share: /(分享|转发|share)/i,
+    follow: /(关注|follow)/i,
+  });
+}
+
+const COMMENT_SELECTORS = [
+  'textarea[placeholder*="评论"]',
+  'textarea[placeholder*="说点什么"]',
+  'input[placeholder*="评论"]',
+  '[contenteditable="true"][data-placeholder*="评论"]',
+  '[contenteditable="true"][data-placeholder*="说点什么"]',
+  '[role="textbox"]',
+  '[contenteditable="true"]',
+  "textarea",
+];
+
+const MESSAGE_SELECTORS = [
+  'textarea[placeholder*="消息"]',
+  'textarea[placeholder*="说点什么"]',
+  'input[placeholder*="消息"]',
+  '[contenteditable="true"][data-placeholder*="消息"]',
+  '[contenteditable="true"][data-placeholder*="说点什么"]',
+  '[role="textbox"]',
+  '[contenteditable="true"]',
+  "textarea",
+];
+
+async function fillCommentBox(page, text) {
+  await clickSemanticControl(page, "comment").catch(() => null);
+  const selector = await fillFirstVisible(page, COMMENT_SELECTORS, text, "comment");
+  return { selector, selectors: COMMENT_SELECTORS };
+}
+
+async function fillMessageBox(page, text) {
+  const selector = await fillFirstVisible(page, MESSAGE_SELECTORS, text, "message");
+  return { selector, selectors: MESSAGE_SELECTORS };
+}
+
 async function cmdMessage(args) {
   const recipient = args._[1];
   const message = args._[2];
   if (!recipient || message === undefined) throw new Error("message requires RECIPIENT MESSAGE");
+  if (!String(message).trim()) throw new Error("message content must not be empty");
   const session = await launch(args.browser, args.account);
-  const { context } = session;
-  const page = await pageFor(context);
-  await goto(page, "https://www.xiaohongshu.com/notification");
-  await clickByText(page, recipient);
-  await fillFirstEditable(page, message);
-  if (args.direct) await page.keyboard.press("Enter");
-  console.log(JSON.stringify({ recipient, direct: Boolean(args.direct), url: page.url() }, null, 2));
-  await safeCleanup(session);
+  try {
+    const page = await pageFor(session.context);
+    await goto(page, "https://www.xiaohongshu.com/notification");
+    await clickByText(page, recipient);
+    const field = await fillMessageBox(page, message);
+    let verification = { status: "staged" };
+    if (args.direct) {
+      await page.keyboard.press("Enter");
+      await page.waitForTimeout(1000);
+      verification = await sdkVerifyTextSubmission(page, field.selectors, message);
+    }
+    const result = { recipient, direct: Boolean(args.direct), verification, url: page.url() };
+    console.log(JSON.stringify(result, null, 2));
+    if (args.direct && verification.status !== "confirmed") {
+      throw new Error(`Message delivery is ${verification.status}: ${verification.reason || "no delivery evidence"}`);
+    }
+  } finally {
+    await safeCleanup(session);
+  }
 }
 
 async function cmdPublish(args) {
   const packagePath = args._[1];
   if (!packagePath) throw new Error("publish requires PACKAGE_JSON");
+  validatePostPackage(JSON.parse(fs.readFileSync(path.resolve(packagePath), "utf8")), packagePath);
   const session = await launch(args.browser, args.account);
-  const page = await pageFor(session.context);
-  const result = await publishPackage(page, packagePath, args);
-  console.log(JSON.stringify(result, null, 2));
-  await safeCleanup(session);
+  try {
+    const page = await pageFor(session.context);
+    const result = await publishPackage(page, packagePath, args);
+    console.log(JSON.stringify(result, null, 2));
+    assertDirectPublishConfirmed(result);
+  } finally {
+    await safeCleanup(session);
+  }
+}
+
+function validatePostPackage(data, packagePath) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("Post package must be a JSON object");
+  }
+  const title = cleanText(data.title);
+  if (!title) throw new Error("Xiaohongshu post package requires a non-empty title");
+  const titleLength = Array.from(title).length;
+  if (titleLength > 20) throw new Error(`Xiaohongshu title is too long (${titleLength}/20): ${title}`);
+  const requestedImages = Array.isArray(data.images) ? data.images.map((value) => path.resolve(String(value))) : [];
+  if (!requestedImages.length) throw new Error("Xiaohongshu image-note package requires at least one image");
+  const invalidImages = requestedImages.filter((file) => !fs.statSync(file, { throwIfNoEntry: false })?.isFile());
+  if (invalidImages.length) throw new Error(`Post package references missing or invalid image files: ${invalidImages.join(", ")}`);
+  return { title, files: requestedImages, package: path.resolve(packagePath) };
+}
+
+async function verifyPublishOutcome(page, args = {}) {
+  const timeoutMs = Number(args["publish-timeout-ms"] || args.publishTimeoutMs || 12000);
+  const pollMs = Number(args["publish-poll-ms"] || args.publishPollMs || 750);
+  const startedAt = Date.now();
+  let lastSnapshot = { body: "" };
+  while (Date.now() - startedAt <= timeoutMs) {
+    lastSnapshot = await pageSnapshot(page, 30);
+    const body = lastSnapshot.body || "";
+    const success = /[?&]published=true\b/.test(page.url()) || /发布成功|已发布|审核中|提交成功/.test(body);
+    if (success) {
+      return {
+        status: "published",
+        likelyPublished: true,
+        url: page.url(),
+        waitedMs: Date.now() - startedAt,
+        bodyExcerpt: body.slice(0, 600),
+      };
+    }
+    const block = await detectBlock(page);
+    if (block) {
+      return {
+        status: "blocked",
+        likelyPublished: false,
+        url: page.url(),
+        waitedMs: Date.now() - startedAt,
+        block,
+        bodyExcerpt: body.slice(0, 600),
+      };
+    }
+    await page.waitForTimeout(pollMs);
+  }
+  return {
+    status: "unconfirmed",
+    likelyPublished: false,
+    url: page.url(),
+    waitedMs: Date.now() - startedAt,
+    bodyExcerpt: (lastSnapshot.body || "").slice(0, 600),
+  };
+}
+
+function publishOperationVerification(result) {
+  if (!result.direct) return { status: "staged" };
+  const verification = result.publishVerification;
+  if (verification?.status === "published") {
+    return { status: "confirmed", evidence: "creator page reported published", publishVerification: verification };
+  }
+  if (verification?.status === "blocked") {
+    return { status: "blocked", reason: "creator page reported a block", block: verification.block, publishVerification: verification };
+  }
+  return { status: "unconfirmed", reason: "creator page did not confirm publication", publishVerification: verification || null };
+}
+
+function assertDirectPublishConfirmed(result) {
+  const verification = publishOperationVerification(result);
+  if (result.direct && verification.status !== "confirmed") {
+    throw new Error(`Publish is ${verification.status}: ${verification.reason || "creator page did not confirm publication"}`);
+  }
 }
 
 async function publishPackage(page, packagePath, args = {}) {
   const data = JSON.parse(fs.readFileSync(path.resolve(packagePath), "utf8"));
+  const packageInfo = validatePostPackage(data, packagePath);
   const bodyText = [
     data.body || data.title || "",
     "",
-    ...(data.hashtags || []).map((t) => `#${String(t).replace(/^#/, "")}`),
+    ...(Array.isArray(data.hashtags) ? data.hashtags : []).map((t) => `#${String(t).replace(/^#/, "")}`),
   ]
     .join("\n")
     .trim();
   await goto(page, args.url || "https://creator.xiaohongshu.com/publish/publish");
   await assertNotBlocked(page, "open creator publish page");
-  await page.getByText("上传图文", { exact: true }).last().click().catch(async () => {
-    await page.getByText("上传图文").last().click();
-  });
+  const modeSelection = await clickAnyText(page, ["上传图文", "发布图文"], 1200);
+  if (!modeSelection.clicked && !(await page.locator("input[type='file']").count().catch(() => 0))) {
+    throw new Error("Xiaohongshu image upload mode is unavailable");
+  }
   await page.waitForTimeout(1200);
   await assertNotBlocked(page, "select image publishing");
 
-  const files = (data.images || []).map((p) => path.resolve(p)).filter((p) => fs.existsSync(p));
-  const fileInput = page.locator("input[type='file']").first();
-  if (files.length && (await fileInput.count().catch(() => 0))) {
-    await fileInput.setInputFiles(files);
-    await page.waitForTimeout(Number(args["upload-wait-ms"] || args.uploadWaitMs || 5000));
-  } else if (files.length) {
-    throw new Error("No upload file input found");
-  }
+  const files = packageInfo.files;
+  const fileInput = page.locator("input[type='file']");
+  const fileInputCount = await fileInput.count().catch(() => 0);
+  if (!fileInputCount) throw new Error("No upload file input found");
+  await fileInput.nth(fileInputCount - 1).setInputFiles(files);
+  await page.waitForTimeout(Number(args["upload-wait-ms"] || args.uploadWaitMs || 5000));
 
   await fillFirstVisible(
     page,
@@ -856,7 +923,7 @@ async function publishPackage(page, packagePath, args = {}) {
       ".d-input input",
       "input[type='text']",
     ],
-    data.title || "",
+    packageInfo.title,
     "title"
   );
   await fillFirstVisible(
@@ -876,23 +943,15 @@ async function publishPackage(page, packagePath, args = {}) {
   let publishVerification = null;
   if (args.direct) {
     publishAttempt = await publishViaCreatorButton(page);
-    await page.waitForTimeout(2500);
-    await assertNotBlocked(page, "publish submit");
-    const snapshot = await pageSnapshot(page, 30);
-    publishVerification = {
-      url: page.url(),
-      likelyPublished:
-        /[?&]published=true\b/.test(page.url()) ||
-        /发布成功|已发布|审核中|提交成功/.test(snapshot.body),
-      bodyExcerpt: snapshot.body.slice(0, 600),
-    };
+    publishVerification = await verifyPublishOutcome(page, args);
   }
   return {
-    package: path.resolve(packagePath),
+    package: packageInfo.package,
     direct: Boolean(args.direct),
     url: page.url(),
     files,
-    title: data.title || "",
+    title: packageInfo.title,
+    modeSelection,
     publishAttempt,
     publishVerification,
   };
@@ -943,13 +1002,13 @@ async function runOperation(page, op, args, index) {
   }
   if (action === "click") {
     if (!op.selector) throw new Error(`operation ${index} requires selector`);
-    await page.locator(op.selector).first().click();
+    const clicked = await clickFirstVisibleSelector(page, op.selector, "click target");
     await page.waitForTimeout(Number(op.waitMs ?? 800));
-    return { action, selector: op.selector, url: page.url() };
+    return { action, ...clicked, url: page.url() };
   }
   if (action === "fill") {
     if (!op.selector || op.text === undefined) throw new Error(`operation ${index} requires selector and text`);
-    await page.locator(op.selector).first().fill(String(op.text));
+    await fillFirstVisible(page, [op.selector], String(op.text), op.selector);
     return { action, selector: op.selector };
   }
   if (action === "fill-first" || action === "fill_first") {
@@ -965,16 +1024,26 @@ async function runOperation(page, op, args, index) {
   }
   if (action === "comment") {
     if (op.text === undefined) throw new Error(`operation ${index} requires text`);
-    const selector = await fillFirstEditable(page, String(op.text));
-    if (direct) await page.keyboard.press("Enter");
-    await page.waitForTimeout(Number(op.waitMs ?? 1000));
-    return { action, selector, direct: Boolean(direct), url: page.url() };
+    if (!String(op.text).trim()) throw new Error(`operation ${index} comment text must not be empty`);
+    const field = await fillCommentBox(page, String(op.text));
+    let verification = { status: "staged" };
+    if (direct) {
+      await page.keyboard.press("Enter");
+      await page.waitForTimeout(Number(op.waitMs ?? 1000));
+      verification = await sdkVerifyTextSubmission(page, field.selectors, String(op.text));
+    }
+    return { action, selector: field.selector, direct: Boolean(direct), verification, url: page.url() };
   }
-  if (action === "like" || action === "favorite" || action === "collect") {
-    const text = op.text || (action === "like" ? /点赞|赞|Like/i : /收藏|Collect|Favorite|Save/i);
-    await page.getByText(text).last().click();
-    await page.waitForTimeout(Number(op.waitMs ?? 800));
-    return { action, url: page.url() };
+  if (action === "like" || action === "favorite" || action === "collect" || action === "share" || action === "follow") {
+    const waitMs = Number(op.waitMs ?? 800);
+    const result = op.text
+      ? await clickAnyText(page, [op.text], waitMs)
+      : await clickSemanticControl(page, action);
+    if (!result.clicked) throw new Error(`No clickable ${action} control found`);
+    const verification = op.text
+      ? { status: "unconfirmed", reason: "text-targeted interaction has no platform state verifier" }
+      : await sdkVerifySemanticClick(page, result, waitMs);
+    return { action, result, verification, url: page.url() };
   }
   if (action === "scroll") {
     const times = Number(op.times || 1);
@@ -1008,7 +1077,8 @@ async function runOperation(page, op, args, index) {
   }
   if (action === "publish-package" || action === "publish_package") {
     if (!op.package) throw new Error(`operation ${index} requires package`);
-    return { action, result: await publishPackage(page, op.package, { ...args, ...op, direct }) };
+    const result = await publishPackage(page, op.package, { ...args, ...op, direct });
+    return { action, result, verification: publishOperationVerification(result) };
   }
   if (action === "evaluate") {
     if (!op.js) throw new Error(`operation ${index} requires js`);
@@ -1103,6 +1173,6 @@ async function main() {
 main()
   .then(() => process.exit(0))
   .catch((err) => {
-    console.error(`xiaohongshu_web.mjs: ${err.message}`);
+    console.error(`xiaohongshu_web.mjs: ${err.message}${err.artifactDir ? `\nartifacts: ${err.artifactDir}` : ""}`);
     process.exit(2);
   });

@@ -13,13 +13,19 @@ function safeName(value) {
   return String(value || "run").replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "run";
 }
 
+function runDirFor(stateDir, command, outDir) {
+  if (!outDir) return path.join(stateDir, "artifacts", `${stamp()}-${safeName(command)}-${process.pid}`);
+  const requested = path.resolve(outDir);
+  if (!fs.existsSync(requested)) return requested;
+  if (!fs.readdirSync(requested).length) return requested;
+  return `${requested}-${stamp()}-${process.pid}`;
+}
+
 export class TaskArtifacts {
   constructor({ stateDir, platform, command, planPath = "", outDir = "" }) {
     this.platform = platform;
     this.command = command || "command";
-    this.runDir = outDir
-      ? path.resolve(outDir)
-      : path.join(stateDir, "artifacts", `${stamp()}-${safeName(command)}-${process.pid}`);
+    this.runDir = runDirFor(stateDir, command, outDir);
     ensureDir(this.runDir);
     this.writeJson("manifest.json", {
       platform,

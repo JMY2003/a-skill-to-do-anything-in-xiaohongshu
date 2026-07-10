@@ -16,7 +16,7 @@ For multi-step work, prefer:
 scripts/xiaohongshu_web.mjs run-plan PLAN_JSON --browser default --direct
 ```
 
-`run-plan` keeps one browser session alive, executes operations in order, and writes structured artifacts for every step.
+`run-plan` keeps one browser session alive, executes operations in order, and writes structured artifacts for every step. Interaction and publishing steps record `confirmed`, `unconfirmed`, or `blocked` evidence, so a UI click is never silently reported as a completed platform action.
 
 ## Why This Exists
 
@@ -29,6 +29,7 @@ Most browser automation breaks down when a platform changes layout, hides contro
 - Feed/note extraction that prefers Xiaohongshu page state before DOM fallbacks
 - Post packages and deterministic image/card generation for publishing workflows
 - Artifacts for runs, steps, failures, and final results
+- Completion verification that separates UI attempts from confirmed social actions
 
 ## Capabilities
 
@@ -112,6 +113,8 @@ Send a direct message to a visible recipient:
 ```bash
 scripts/xiaohongshu_web.mjs message "好友名" "测试信息" --browser default --direct
 ```
+
+The command exits nonzero when delivery cannot be confirmed, while retaining the observed result for diagnosis.
 
 Stop the reusable browser when you want a clean end state:
 
@@ -207,6 +210,8 @@ scripts/xiaohongshu_web.mjs publish /tmp/xiaohongshu-post/post.json \
   --direct
 ```
 
+A direct publish exits nonzero unless Creator Center reports that the note was submitted or published.
+
 For more reliable publishing, especially when debugging Creator Center UI changes, run publishing through a plan:
 
 ```json
@@ -257,13 +262,13 @@ A reusable CDP browser is bound to one account/profile at a time. Close it befor
     ├── xiaohongshu_web.mjs
     ├── xiaohongshu_package.py
     ├── xiaohongshu_image.py
-    ├── xiaohongshu_app.py
     ├── sdk_selftest.mjs
     └── sdk/
         ├── account_manager.mjs
         ├── diagnostics.mjs
         ├── interaction_actions.mjs
         ├── plan_runner.mjs
+        ├── runtime_guard.mjs
         ├── task_artifacts.mjs
         └── xiaohongshu_feed_explorer.mjs
 ```
@@ -279,7 +284,6 @@ Key modules:
 - `scripts/sdk/xiaohongshu_feed_explorer.mjs`: search/feed extraction
 - `scripts/xiaohongshu_package.py`: post package creation and inspection
 - `scripts/xiaohongshu_image.py`: cover/card image generation
-- `scripts/xiaohongshu_app.py`: legacy native-app fallback
 
 ## Artifacts
 
@@ -289,6 +293,7 @@ Key modules:
 - `steps.jsonl`
 - `steps/step-NNN.json`
 - `step-N-failed.snapshot.json` or `step-N-blocked.snapshot.json`
+- `step-N-unconfirmed.snapshot.json` when an interaction lacks completion evidence
 - `result.json`
 
 These files make long-running and batch tasks easier to audit and resume.

@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Create and inspect Xiaohongshu post packages.
-
-The package is a small JSON file that `xiaohongshu_app.py stage-post` can paste into
-the Xiaohongshu publisher after the user approves the content.
-"""
+"""Create and inspect Xiaohongshu post packages for web publishing."""
 
 from __future__ import annotations
 
@@ -22,6 +18,14 @@ def normalize_tags(raw_tags: list[str]) -> list[str]:
             if tag and tag not in tags:
                 tags.append(tag)
     return tags[:8]
+
+
+def local_paths(raw_paths: list[str], label: str) -> list[str]:
+    paths = [Path(item).expanduser() for item in raw_paths]
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise ValueError(f"Missing {label} file(s): {', '.join(missing)}")
+    return [str(path) for path in paths]
 
 
 def draft_body(topic: str, audience: str, tone: str, angle: str) -> str:
@@ -54,7 +58,7 @@ def make_package(args: argparse.Namespace) -> dict:
         "title": title,
         "body": body,
         "hashtags": tags,
-        "images": [str(Path(p).expanduser()) for p in args.image or []],
+        "images": local_paths(args.image or [], "image"),
         "image_prompts": args.image_prompt or [],
         "settings": {
             "location": args.location or "",
@@ -131,7 +135,10 @@ def main() -> int:
     show.set_defaults(func=cmd_show)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     return 0
 
 

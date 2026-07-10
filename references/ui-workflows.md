@@ -13,7 +13,7 @@ Use the web backend first: `scripts/xiaohongshu_web.mjs`. For anything beyond on
 
 The saved session lives under `state/web/profiles/`. If Xiaohongshu expires the session, run `login` again.
 
-Run `scripts/xiaohongshu_web.mjs status --browser default` before publishing, batch messaging, or other direct actions. Check both `loggedInLikely` and `block`; a nonzero cookie count is not enough because Xiaohongshu may redirect the creator center or notification page to login.
+Run `scripts/xiaohongshu_web.mjs status --browser default` before publishing, batch messaging, or other direct actions. Check `loginState`, `sessionCookies`, and `block`; a nonzero cookie count is not enough because Xiaohongshu may redirect the creator center or notification page to login.
 
 ## Browser Selection
 
@@ -56,7 +56,7 @@ Use these when a specialized command needs adjustment for Xiaohongshu's current 
 scripts/xiaohongshu_web.mjs message "好友名" "消息内容" --browser default --direct
 ```
 
-The command opens the web notification/message area, clicks visible recipient text, fills the first editable field, and sends when `--direct` is supplied.
+The command opens the web notification/message area, clicks visible recipient text, fills the first editable field, and sends when `--direct` is supplied. Direct delivery is confirmed only when the submitted text clears from the message composer; otherwise the command exits nonzero and reports `unconfirmed` rather than claiming the message was sent.
 
 ## Publishing
 
@@ -65,7 +65,7 @@ scripts/xiaohongshu_package.py create --topic TOPIC --out OUT_DIR --title TITLE 
 scripts/xiaohongshu_web.mjs publish OUT_DIR/post.json --browser default --direct
 ```
 
-The command opens Xiaohongshu creator publish URL, uploads files if a file input is visible, fills the first editable field, and clicks a visible publish button when `--direct` is supplied.
+The command opens Xiaohongshu creator publish URL, uploads files if a file input is visible, fills the first editable field, and clicks a visible publish button when `--direct` is supplied. Direct publishing exits nonzero unless Creator Center reports publication.
 
 Publishing may require scrolling internal creator-page containers and clicking/calling a custom `xhs-publish-btn` element. The web script includes this fallback and records `publishAttempt` plus `publishVerification` in the result.
 
@@ -74,7 +74,7 @@ Publishing may require scrolling internal creator-page containers and clicking/c
 For batch tasks, use a target file and call the web script per target. Write JSONL progress:
 
 ```json
-{"target":"name or url","action":"message","status":"done","note":""}
+{"target":"name or url","action":"message","status":"confirmed","note":""}
 ```
 
 Stop the batch if Xiaohongshu web shows a login, captcha, moderation, permission, or rate-limit block.
@@ -88,4 +88,4 @@ scripts/xiaohongshu_web.mjs browser-status --browser default
 scripts/xiaohongshu_web.mjs close-browser --browser default
 ```
 
-`browser-status` reports whether the reusable CDP browser is already running. `close-browser` stops it when the user wants a clean end state.
+`browser-status` reports endpoint health and whether the session is `managed`, `legacy-adopted`, or `unmanaged-or-recoverable`. `close-browser` stops only a recognized skill/legacy Xiaohongshu browser when the user wants a clean end state.

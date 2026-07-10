@@ -7,13 +7,13 @@ Use this reference when extending or repairing the Xiaohongshu automation backen
 - `scripts/xiaohongshu_web.mjs`: thin CLI command dispatch. Keep durable behavior here, not platform logic.
 - `scripts/sdk/account_manager.mjs`: account registry, default account, and isolated persistent profile paths.
 - `scripts/sdk/diagnostics.mjs`: DOM snapshots, block detection, permission/login/rate-limit diagnosis, and scroll-container handling.
-- `scripts/sdk/interaction_actions.mjs`: visible text clicks, semantic control clicks, and editable-field filling.
-- `scripts/sdk/plan_runner.mjs`: canonical multi-step execution engine, artifact writing, failure snapshots, block handling, and final counts.
+- `scripts/sdk/interaction_actions.mjs`: visible text clicks, semantic control clicks, editable-field filling, and post-action evidence checks.
+- `scripts/sdk/plan_runner.mjs`: canonical multi-step execution engine, artifact writing, failure snapshots, block handling, unconfirmed-state capture, and final counts.
 - `scripts/sdk/task_artifacts.mjs`: per-run manifest, step JSON, step JSONL, final result, and DOM diagnostic snapshots on failures or blocks.
+- `scripts/sdk/runtime_guard.mjs`: corruption-tolerant process locks, CDP endpoint checks, profile ownership validation, and controlled legacy-profile adoption.
 - `scripts/sdk/xiaohongshu_feed_explorer.mjs`: search/feed/note card extraction. Prefer `window.__INITIAL_STATE__` note/feed data first, then visible DOM fallbacks.
 - `scripts/xiaohongshu_package.py`: post package creation and inspection.
 - `scripts/xiaohongshu_image.py`: deterministic cover/card generation.
-- `scripts/xiaohongshu_app.py`: legacy native-app fallback only.
 
 ## Extension Rules
 
@@ -33,7 +33,7 @@ Artifacts include:
 - `manifest.json`: command, plan path, pid, cwd, and start time.
 - `steps.jsonl`: start and completion event records.
 - `steps/step-NNN.json`: final per-step record.
-- `step-N-failed.snapshot.json` or `step-N-blocked.snapshot.json`: DOM-level evidence when an operation fails or a web block appears.
+- `step-N-failed.snapshot.json`, `step-N-blocked.snapshot.json`, or `step-N-unconfirmed.snapshot.json`: DOM-level evidence when an operation fails, is blocked, or lacks completion evidence.
 - `result.json`: final result, counts, browser, account, URL, and artifact path.
 
 ## Account Commands
@@ -57,6 +57,7 @@ node --check scripts/sdk/diagnostics.mjs
 node --check scripts/sdk/interaction_actions.mjs
 node --check scripts/sdk/plan_runner.mjs
 node --check scripts/sdk/task_artifacts.mjs
+node --check scripts/sdk/runtime_guard.mjs
 node --check scripts/sdk/xiaohongshu_feed_explorer.mjs
 node scripts/sdk_selftest.mjs
 scripts/xiaohongshu_web.mjs accounts list

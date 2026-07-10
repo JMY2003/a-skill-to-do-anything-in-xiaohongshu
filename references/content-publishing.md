@@ -46,6 +46,8 @@ scripts/xiaohongshu_web.mjs run-plan OUT_DIR/publish-plan.json --browser default
 
 The publish command and `run-plan` use the saved browser profile. Prefer `run-plan` when publishing is part of a larger task, such as drafting cards, uploading media, extracting the final page state, and recording a result.
 
+The image-note publisher requires at least one existing image and a non-empty title of at most 20 characters. It validates those locally before opening Creator Center, so a package error does not leave a half-filled browser draft.
+
 Before publishing, `status` should show no login block. The normal Xiaohongshu site and the creator center can expire independently; a creator redirect with `redirectReason=401` means the browser profile needs login again.
 
 The current creator page is not a plain HTML form. It can use:
@@ -54,4 +56,4 @@ The current creator page is not a plain HTML form. It can use:
 - a custom final submit element, `xhs-publish-btn`, instead of a normal `button`
 - browser-level permission prompts such as location permission in an `edge://permission-request-dialog/` or `chrome://permission-request-dialog/` page
 
-The script handles this by scrolling internal containers, checking for web blocks, and calling the `xhs-publish-btn` publish handler when available. If publishing fails, run a plan with `diagnose` and inspect `customElements`, `controls`, `scrollables`, `block`, and `publishVerification`.
+The script handles this by scrolling internal containers, checking for web blocks, and calling the `xhs-publish-btn` publish handler when available. After a direct submit it polls for `published`, `blocked`, or `unconfirmed` rather than treating normal `审核中` status as a policy failure. A direct `publish` command exits nonzero unless the creator page confirms publication; it still prints its diagnostic JSON first. If publishing fails, run a plan with `diagnose` and inspect `customElements`, `controls`, `scrollables`, `block`, and `publishVerification`.

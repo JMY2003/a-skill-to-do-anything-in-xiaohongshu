@@ -27,7 +27,7 @@ Use `scripts/xiaohongshu_web.mjs run-plan PLAN_JSON --browser default --direct -
 }
 ```
 
-Each operation result is written into `records[]` with `status`, `result`, and optional `error` or `block`. The artifact directory contains `manifest.json`, `steps.jsonl`, `steps/step-NNN.json`, final `result.json`, and DOM diagnostic snapshots for failed or blocked steps.
+Each operation result is written into `records[]` with `status`, `result`, and optional `error`, `block`, or `verification`. `done` means completion evidence was observed; `unconfirmed` means the UI attempt ran but no completion evidence was available. The runner stops at an unconfirmed step by default; set `"continueOnUnconfirmed": true` only when later read-only or diagnostic steps are still useful. The artifact directory contains `manifest.json`, `steps.jsonl`, `steps/step-NNN.json`, final `result.json`, and DOM diagnostic snapshots for failed, blocked, or unconfirmed steps.
 
 ## Supported Operations
 
@@ -38,16 +38,16 @@ Each operation result is written into `records[]` with `status`, `result`, and o
 - `fill`: fill a CSS selector.
 - `fill-first`: fill the first visible editable field.
 - `press`: press a keyboard key such as `Enter`.
-- `comment`: fill the first editable field and press Enter when `--direct` or operation `direct: true` is set.
-- `like`: click a visible like/upvote control by text.
-- `favorite` / `collect`: click a visible collect/save/favorite control by text.
+- `comment`: fill the comment composer and press Enter when `--direct` or operation `direct: true` is set. A direct comment is confirmed only when the submitted text clears from the composer; otherwise it is `unconfirmed`.
+- `like`: click a semantic like/upvote control and require an observable control-state change. A text-only target is `unconfirmed`.
+- `favorite` / `collect`: click a semantic collect/save/favorite control and require an observable control-state change. A text-only target is `unconfirmed`.
 - `scroll`: scroll the page one or more times.
 - `wait`: wait by milliseconds.
 - `extract` / `snapshot`: return URL, title, body text, links, and visible editable fields.
 - `diagnose`: return URL, title, body text, links, editables, visible controls, custom elements, internal scroll containers, and the current block state.
 - `scroll-containers`: scroll every visible internal scroll container to the bottom. Use this before looking for controls that sit in Xiaohongshu's fixed or nested creator panels.
 - `notification`: open `/notification` and extract the visible state.
-- `publish-package`: publish a `xiaohongshu_package.py` JSON package.
+- `publish-package`: publish a `xiaohongshu_package.py` JSON package. Direct publishing is `done` only after Creator Center confirms publication; otherwise it is `blocked` or `unconfirmed`.
 - `evaluate`: run custom JavaScript in the page and return its value.
 
 ## Common Workflows
